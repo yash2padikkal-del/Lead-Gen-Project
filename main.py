@@ -30,8 +30,8 @@ AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
 AIRTABLE_TABLE_NAME = os.environ.get("AIRTABLE_TABLE_NAME", "Leads")
 
-APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN")
-APIFY_ACTOR_ID = "igolaizola~facebook-ad-library-scraper"
+METAPI_API_KEY = os.environ.get("METAPI_API_KEY")
+METAPI_BASE_URL = "https://api.metapi.io/v1"
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 _groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -112,80 +112,131 @@ def strip_html(text):
     return re.sub(r"<[^>]+>", "", text or "").strip()
 
 # ---------------------------------------------------------------------------
-# Signal collection — Meta Ad Library (via Apify)
+# Signal collection — Meta Ad Library (via Metapi)
 # ---------------------------------------------------------------------------
 
 def fetch_ad_library_signals():
-    """
-    Calls the Apify Facebook Ad Library Scraper once per configured keyword,
-    collects results, and dedupes by page_name so each brand only counts once
-    even if it matched multiple keywords.
-    """
-    if not APIFY_API_TOKEN:
-        print("[info] APIFY_API_TOKEN not set — skipping Ad Library fetch.")
-        return []
+    """Fetch Meta Ad Library ads through Metapi and deduplicate by brand."""
+    if not METAPI_API_KEY:
+        raise RuntimeError("METAPI_API_KEY is missing; add it to your local .env or GitHub secrets.")
 
-    brands = {}  # page_name -> brand dict
+    headers = {
+        "Authorization": f"Bearer {METAPI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    brands = {}
+
+    # Metapi's count is the number of ads, not unique brands. Fetch a bounded
+    # pool, then the main pipeline applies SEARCH_LIMIT to unique brands.
+    ad_count = max(100, SEARCH_LIMIT * 10)
 
     for keyword in AD_LIBRARY_KEYWORDS:
         print(f"[info] fetching Ad Library results for: '{keyword}'")
-
-        run_input = {
-            "category": "all",
-            "country": "IN",
-            "proxyConfiguration": {
-                "useApifyProxy": True,
-                "apifyProxyGroups": ["RESIDENTIAL"],
-                "apifyProxyCountry": "IN",
-            },
-            "query": keyword,
-            "fetchDetails": False,
-        }
-
-        # Apify's synchronous endpoint needs time to finish the actor run
-        # before it can return dataset items. Allow up to 300 seconds server-side
-        # and give the HTTP client a little extra time to receive the response.
-        url = (
-            f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}"
-            f"/run-sync-get-dataset-items?token={APIFY_API_TOKEN}&timeout=300"
-        )
-
         try:
-            resp = requests.post(url, json=run_input, timeout=(15, 330))
-            resp.raise_for_status()
-            items = resp.json()
-        except requests.exceptions.RequestException as e:
+            create_response = requests.post(
+                f"{METAPI_BASE_URL}/tasks",
+                headers=headers,
+                json={
+                    "q": keyword,
+                    "country": "IN",
+                    "count": ad_count,
+                    "active_status": "active",
+                    "ad_type": "all",
+                    "search_type": "keyword_unordered",
+                    "sort_data": {
+                        "mode": "relevancy_monthly_grouped",
+                        "direction": "desc",
+                    },
+                },
+                timeout=30,
+            )
+            create_response.raise_for_status()
+            task_id = create_response.json().get("task_id")
+            if not task_id:
+                raise RuntimeError(f"Metapi did not return a task_id: {create_response.text[:500]}")
+
+            # Wait for Metapi to finish processing the search task.
+            deadline = time.time() + 600
+            status = "running"
+            while time.time() < deadline:
+                status_response = requests.get(
+                    f"{METAPI_BASE_URL}/tasks/{task_id}/status",
+                    headers=headers,
+                    timeout=30,
+                )
+                status_response.raise_for_status()
+                status_data = status_response.json()
+                status = status_data.get("status", "running")
+                print(
+                    f"[info] Metapi task {task_id}: {status} "
+                    f"({status_data.get('progress_percent', 0)}%)"
+                )
+                if status in {"succeeded", "failed", "timed_out", "aborted"}:
+                    break
+                time.sleep(5)
+
+            if status != "succeeded":
+                detail = status_data.get("error_message", "") if "status_data" in locals() else ""
+                raise RuntimeError(f"Metapi task ended with status '{status}'. {detail}")
+
+            offset = 0
+            page_size = 500
+            while True:
+                results_response = requests.get(
+                    f"{METAPI_BASE_URL}/tasks/{task_id}/results",
+                    headers=headers,
+                    params={"offset": offset, "limit": page_size},
+                    timeout=60,
+                )
+                results_response.raise_for_status()
+                result_payload = results_response.json()
+                items = result_payload.get("data", [])
+
+                for item in items:
+                    page_name = (item.get("provider_page_name") or "").strip()
+                    if not page_name:
+                        continue
+
+                    page_id = item.get("provider_page_id")
+                    brand_key = str(page_id) if page_id else page_name.casefold()
+                    page_profile_url = (
+                        f"https://www.facebook.com/{page_id}" if page_id else None
+                    )
+
+                    if brand_key not in brands:
+                        brands[brand_key] = {
+                            "source": "Ad Library",
+                            "page_name": page_name,
+                            "page_profile_url": page_profile_url,
+                            "matched_keywords": set(),
+                            "ads": [],
+                        }
+
+                    brand = brands[brand_key]
+                    brand["matched_keywords"].add(keyword)
+                    bodies = item.get("bodies") or []
+                    if isinstance(bodies, str):
+                        bodies = [bodies]
+                    body_text = " ".join(str(body) for body in bodies if body)
+
+                    brand["ads"].append({
+                        "ad_archive_id": item.get("provider_id"),
+                        "body_text": body_text,
+                        "cta_text": item.get("cta_text"),
+                        "link_url": item.get("link_url"),
+                    })
+
+                pagination = result_payload.get("pagination", {})
+                if not pagination.get("has_more") or not items:
+                    break
+                offset += len(items)
+
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
             print(
-                f"[warn] Ad Library fetch failed for '{keyword}': {e}",
+                f"[warn] Metapi search failed for '{keyword}': {exc}",
                 file=sys.stderr,
             )
             continue
-
-        for item in items:
-            snapshot = item.get("snapshot", {}) or {}
-            page_name = snapshot.get("page_name")
-            if not page_name:
-                continue
-
-            if page_name not in brands:
-                brands[page_name] = {
-                    "source": "Ad Library",
-                    "page_name": page_name,
-                    "page_profile_url": snapshot.get("page_profile_uri"),
-                    "matched_keywords": set(),
-                    "ads": [],
-                }
-
-            brands[page_name]["matched_keywords"].add(keyword)
-            body = snapshot.get("body", {}) or {}
-            brands[page_name]["ads"].append({
-                "ad_archive_id": item.get("ad_archive_id"),
-                "body_text": body.get("text", ""),
-                "cta_text": snapshot.get("cta_text"),
-                "link_url": snapshot.get("link_url"),
-            })
-
-        time.sleep(2)  # small buffer between actor calls
 
     for brand in brands.values():
         brand["matched_keywords"] = sorted(brand["matched_keywords"])
