@@ -11,6 +11,16 @@ on:
         required: false
         type: string
         default: ""
+      search_limit:
+        description: "Maximum number of unique brands to process"
+        required: false
+        type: choice
+        options:
+          - "10"
+          - "25"
+          - "50"
+          - "100"
+        default: "25"
 
 permissions:
   contents: read
@@ -43,5 +53,6 @@ jobs:
           APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           SEARCH_KEYWORD: ${{ github.event.inputs.keyword || '' }}
+          SEARCH_LIMIT: ${{ github.event.inputs.search_limit || '25' }}
           SEARCH_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: python main.py

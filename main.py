@@ -41,6 +41,20 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 CUSTOM_KEYWORD = os.environ.get("SEARCH_KEYWORD", "").strip()
 SEARCH_ID = os.environ.get("SEARCH_ID", "").strip() or str(uuid.uuid4())
 
+# Maximum number of unique Ad Library brands to process per run.
+# The dashboard will pass one of these supported values.
+ALLOWED_SEARCH_LIMITS = (10, 25, 50, 100)
+try:
+    SEARCH_LIMIT = int(os.environ.get("SEARCH_LIMIT", "25"))
+except (TypeError, ValueError):
+    SEARCH_LIMIT = 25
+
+if SEARCH_LIMIT not in ALLOWED_SEARCH_LIMITS:
+    print(
+        f"[warn] unsupported SEARCH_LIMIT={SEARCH_LIMIT}; defaulting to 25"
+    )
+    SEARCH_LIMIT = 25
+
 # Google Alerts RSS feed URLs — create these at google.com/alerts, set delivery
 # to "RSS feed", and paste the feed URLs here (one per query you set up).
 RSS_FEEDS = [
@@ -128,13 +142,16 @@ def fetch_ad_library_signals():
             "fetchDetails": False,
         }
 
+        # Apify's synchronous endpoint needs time to finish the actor run
+        # before it can return dataset items. Allow up to 300 seconds server-side
+        # and give the HTTP client a little extra time to receive the response.
         url = (
             f"https://api.apify.com/v2/acts/{APIFY_ACTOR_ID}"
-            f"/run-sync-get-dataset-items?token={APIFY_API_TOKEN}"
+            f"/run-sync-get-dataset-items?token={APIFY_API_TOKEN}&timeout=300"
         )
 
         try:
-            resp = requests.post(url, json=run_input, timeout=90)
+            resp = requests.post(url, json=run_input, timeout=(15, 330))
             resp.raise_for_status()
             items = resp.json()
         except requests.exceptions.RequestException as e:
@@ -448,7 +465,17 @@ def main():
         rss_signals = fetch_rss_signals()
         search_keyword_for_records = ", ".join(AD_LIBRARY_KEYWORDS)
 
-    ad_library_signals = fetch_ad_library_signals()[:10]
+    # Apply the requested cap after fetch_ad_library_signals() has deduplicated
+    # results by page_name, so the limit represents unique brands, not ads.
+    all_ad_library_signals = fetch_ad_library_signals()
+    ad_library_signals = all_ad_library_signals[:SEARCH_LIMIT]
+
+    print(
+        f"[info] processing {len(ad_library_signals)} of "
+        f"{len(all_ad_library_signals)} unique Ad Library brands "
+        f"(limit: {SEARCH_LIMIT})"
+    )
+
     signals = rss_signals + ad_library_signals
     print(f"[info] search ID: {SEARCH_ID}")
     print(f"[info] collected {len(signals)} raw signals")
