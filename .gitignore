@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 __pycache__/
 *.pyc
 .env
@@ -153,4 +152,16 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
->>>>>>> cbe250ddf5f89865c4118b8ff759b0fce4342d3b
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Generated ML datasets
+ml/synthetic_leads.csv
+
+# PyCharm
+.idea/
