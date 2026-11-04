@@ -97,7 +97,7 @@ DEFAULT_AD_LIBRARY_KEYWORDS = [
     "apparel brand India",
 ]
 
-# Accept one keyword or multiple comma-separated keywords.
+# Accept one keyword or multiple comma-separated keywords from the dashboard.
 AD_LIBRARY_KEYWORDS = (
     [
         keyword.strip()
@@ -179,13 +179,17 @@ UNSUITABLE_HOSTS = {
 def scraper_python():
 
     candidates = [
+
         SCRAPER_REPO / ".venv" / "Scripts" / "python.exe",
+
         SCRAPER_REPO / ".venv" / "bin" / "python",
+
     ]
 
     for path in candidates:
 
         if path.exists():
+
             return str(path)
 
     return sys.executable
@@ -247,18 +251,14 @@ def run_scraper(max_ads):
                     f"[warn] Scraper exited with code "
                     f"{completed.returncode} for '{keyword}'."
                 )
-
                 if completed.stderr:
                     print(completed.stderr[-2000:])
-
                 print(
                     "[info] Checking for usable partial results..."
                 )
 
         except subprocess.TimeoutExpired as error:
-
             timed_out = True
-
             print(
                 f"[warn] Scraper timed out for '{keyword}' "
                 f"after {SCRAPER_TIMEOUT} seconds."
@@ -266,75 +266,52 @@ def run_scraper(max_ads):
 
             if error.stdout:
                 output = error.stdout
-
                 if isinstance(output, bytes):
-                    output = output.decode(
-                        "utf-8",
-                        errors="replace"
-                    )
-
+                    output = output.decode("utf-8", errors="replace")
                 print(output[-2500:])
 
             if error.stderr:
                 error_text = error.stderr
-
                 if isinstance(error_text, bytes):
-                    error_text = error_text.decode(
-                        "utf-8",
-                        errors="replace"
-                    )
-
+                    error_text = error_text.decode("utf-8", errors="replace")
                 print(error_text[-2000:])
 
-        # Check for output even if the scraper exited unsuccessfully.
         if not SCRAPER_OUTPUT.exists():
-
             print(
                 f"[warn] No fresh scraper output available for '{keyword}'."
             )
-
             continue
 
         try:
-
             with open(
                 SCRAPER_OUTPUT,
                 "r",
                 encoding="utf-8"
             ) as file:
-
                 ads = json.load(file)
 
         except (OSError, json.JSONDecodeError) as error:
-
             print(
                 f"[warn] Could not read scraper output for "
                 f"'{keyword}': {error}"
             )
-
             continue
 
         if not isinstance(ads, list):
-
             print(
                 f"[warn] Scraper output for '{keyword}' "
                 "was not a JSON list."
             )
-
             continue
 
         new_count = 0
 
         for raw_ad in ads:
-
             if not isinstance(raw_ad, dict):
                 continue
 
             ad = dict(raw_ad)
-
-            ad_id = str(
-                ad.get("ad_id") or ""
-            ).strip()
+            ad_id = str(ad.get("ad_id") or "").strip()
 
             if ad_id and ad_id in seen_ids:
                 continue
@@ -343,26 +320,20 @@ def run_scraper(max_ads):
                 seen_ids.add(ad_id)
 
             ad["_matched_keyword"] = keyword
-
             collected.append(ad)
-
             new_count += 1
 
         label = "partial " if timed_out else ""
-
         print(
             f"[info] Added {new_count} unique ads "
             f"from {label}results for '{keyword}'."
         )
 
     if not collected:
-
         print("[warn] No ads were collected from any keyword.")
-
         return [], None
 
     data_dir = ROOT / "data"
-
     data_dir.mkdir(
         parents=True,
         exist_ok=True
@@ -378,7 +349,6 @@ def run_scraper(max_ads):
         "w",
         encoding="utf-8"
     ) as file:
-
         json.dump(
             collected,
             file,
@@ -543,7 +513,6 @@ def classify_apparel_brand(advertiser):
         phrase in combined
         for phrase in negative_phrases
     ):
-
         return False
 
     # Categories are useful positive evidence.
@@ -618,7 +587,6 @@ def classify_apparel_brand(advertiser):
         return True
 
     return None
-
 
 def normalise_advertiser(advertiser, website):
 
@@ -1117,14 +1085,12 @@ def main():
     if configured_limit:
 
         try:
-
             max_ads = int(configured_limit)
 
             if max_ads <= 0:
                 raise ValueError
 
         except ValueError:
-
             raise ValueError(
                 f"Invalid SEARCH_LIMIT: {configured_limit}. "
                 "Expected a positive integer."
@@ -1265,15 +1231,11 @@ def main():
             "unknown"
         )
 
-        qualification = result.get("qualification") or {}
+        # Keep every lead unless the pipeline explicitly rejects it.
+        # This allows unscored and pending-enrichment leads through.
+        is_accepted = status != "rejected"
 
-        is_qualified = (
-            isinstance(qualification, dict)
-            and qualification.get("qualified") is True
-        )
-
-        if is_qualified:
-
+        if is_accepted:
             airtable_records.append(
                 make_airtable_record(
                     lead,
@@ -1283,49 +1245,33 @@ def main():
 
         print(
             f"[result] {brand_name}: {status} "
-            f"(qualified: {is_qualified}; "
+            f"(included: {is_accepted}; "
             f"ANN score: {result.get('priority_score')})"
         )
 
     # Keep every processed lead in debug output for auditing.
     write_debug_results(debug_results)
 
-    # Only explicitly qualified prospects are sent to Airtable.
+    # Only explicitly rejected prospects are excluded.
     write_to_airtable(airtable_records)
 
-    # Export exactly the same qualified prospects sent to Airtable.
-    qualified_results = [
+    # Excel uses the same inclusion rule as Airtable.
+    exportable_results = [
         item
         for item in debug_results
-        if (
-            isinstance(
-                item.get("pipeline_result", {}).get("qualification"),
-                dict
-            )
-            and item["pipeline_result"]["qualification"].get(
-                "qualified"
-            ) is True
-        )
+        if item.get("pipeline_result", {}).get("status") != "rejected"
     ]
 
-    if qualified_results:
-
+    if exportable_results:
         export_path = export_to_excel(
-            results=qualified_results,
+            results=exportable_results,
             search_id=SEARCH_ID,
             search_keywords=SEARCH_KEYWORD_FOR_RECORDS,
             output_directory=ROOT / "data" / "exports"
         )
-
-        print(
-            f"[ok] Qualified-lead Excel workbook generated: {export_path}"
-        )
-
+        print(f"[ok] Lead Excel workbook generated: {export_path}")
     else:
-
-        print(
-            "[info] No qualified leads found; no Excel export generated."
-        )
+        print("[info] No non-rejected leads found; no Excel export generated.")
 
     counts = {}
 
@@ -1346,7 +1292,7 @@ def main():
 
     print(
         f"[complete] Processed {processed_count} advertisers; "
-        f"sent {len(airtable_records)} qualified records to Airtable."
+        f"sent {len(airtable_records)} non-rejected records to Airtable."
     )
 
 
