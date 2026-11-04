@@ -1,16 +1,22 @@
 name: Run Lead-Gen Monitor
-
+run-name: LeadGen Search - ${{ inputs.request_id || 'Scheduled Run' }}
 on:
   schedule:
     - cron: "0 6,18 * * *"
 
   workflow_dispatch:
     inputs:
+      request_id:
+        description: "Unique frontend search request ID"
+        required: false
+        type: string
+        default: ""
       keyword:
         description: "Keyword to search in Meta Ad Library (leave blank for default searches)"
         required: false
         type: string
         default: ""
+
       search_limit:
         description: "Maximum number of unique brands to process"
         required: false
@@ -24,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: leadgen-monitor
@@ -57,3 +64,11 @@ jobs:
           SEARCH_LIMIT: ${{ github.event.inputs.search_limit || '25' }}
           SEARCH_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: python main.py
+
+      - name: Upload Excel export
+        uses: actions/upload-artifact@v4
+        with:
+          name: leadgen-export-${{ github.run_id }}-${{ github.run_attempt }}
+          path: data/exports/*.xlsx
+          if-no-files-found: warn
+          retention-days: 7
