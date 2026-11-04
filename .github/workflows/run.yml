@@ -69,6 +69,12 @@ jobs:
           pip install -r requirements-playwright.txt
           playwright install --with-deps chromium
 
+      - name: Verify scraper checkout
+        run: |
+          echo "Workspace: $GITHUB_WORKSPACE"
+          ls -la "$GITHUB_WORKSPACE/facebook-ads-scraper"
+          test -f "$GITHUB_WORKSPACE/facebook-ads-scraper/playwright_scraper.py"
+
       - name: Run lead-gen monitor
         env:
           AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
@@ -77,9 +83,14 @@ jobs:
           APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
           METAPI_API_KEY: ${{ secrets.METAPI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+
+          FACEBOOK_SCRAPER_DIR: ${{ github.workspace }}/facebook-ads-scraper
+          FACEBOOK_SCRAPER_SCRIPT: ${{ github.workspace }}/facebook-ads-scraper/playwright_scraper.py
+
           SEARCH_KEYWORD: ${{ github.event.inputs.keyword || '' }}
           SEARCH_LIMIT: ${{ github.event.inputs.search_limit || '25' }}
           SEARCH_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+
         run: python main.py
 
       - name: Upload Excel export

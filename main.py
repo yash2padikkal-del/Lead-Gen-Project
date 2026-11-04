@@ -44,15 +44,19 @@ AIRTABLE_TABLE_NAME = os.environ.get(
     "Leads"
 )
 
-SCRAPER_REPO = Path(os.environ.get(
-    "FACEBOOK_SCRAPER_DIR",
-    ROOT.parent / "facebook-ads-scraper"
-))
+SCRAPER_REPO = Path(
+    os.environ.get(
+        "FACEBOOK_SCRAPER_DIR",
+        ROOT.parent / "facebook-ads-scraper"
+    )
+).resolve()
 
-SCRAPER_SCRIPT = Path(os.environ.get(
-    "FACEBOOK_SCRAPER_SCRIPT",
-    SCRAPER_REPO / "playwright_scraper.py"
-))
+SCRAPER_SCRIPT = Path(
+    os.environ.get(
+        "FACEBOOK_SCRAPER_SCRIPT",
+        SCRAPER_REPO / "playwright_scraper.py"
+    )
+).resolve()
 
 SCRAPER_OUTPUT = SCRAPER_REPO / "facebook_ads.json"
 
