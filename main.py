@@ -1222,8 +1222,13 @@ def main():
             "unknown"
         )
 
-        if status != "rejected":
+        qualification = result.get("qualification") or {}
+        is_qualified = (
+            isinstance(qualification, dict)
+            and qualification.get("qualified") is True
+        )
 
+        if is_qualified:
             airtable_records.append(
                 make_airtable_record(
                     lead,
@@ -1233,37 +1238,36 @@ def main():
 
         print(
             f"[result] {brand_name}: {status} "
-            f"(ANN score: {result.get('priority_score')})"
+            f"(qualified: {is_qualified}; "
+            f"ANN score: {result.get('priority_score')})"
         )
 
-    # Save complete debug output, including rejected and pending advertisers.
+    # Keep every processed lead in debug output for auditing.
     write_debug_results(debug_results)
 
-    # Submit the non-rejected records to Airtable first.
-    # If this raises an exception, the Excel export will not run.
+    # Only explicitly qualified prospects are sent to Airtable.
     write_to_airtable(airtable_records)
 
-    # Export only the same non-rejected leads submitted to Airtable.
-    if airtable_records:
+    # Export exactly the same qualified prospects sent to Airtable.
+    qualified_results = [
+        item
+        for item in debug_results
+        if (
+            isinstance(item.get("pipeline_result", {}).get("qualification"), dict)
+            and item["pipeline_result"]["qualification"].get("qualified") is True
+        )
+    ]
 
-        exportable_results = [
-            item
-            for item in debug_results
-            if item.get("pipeline_result", {}).get("status") != "rejected"
-        ]
-
+    if qualified_results:
         export_path = export_to_excel(
-            results=exportable_results,
+            results=qualified_results,
             search_id=SEARCH_ID,
             search_keywords=SEARCH_KEYWORD_FOR_RECORDS,
             output_directory=ROOT / "data" / "exports"
         )
-
-        print(f"[ok] Excel workbook generated: {export_path}")
-
+        print(f"[ok] Qualified-lead Excel workbook generated: {export_path}")
     else:
-
-        print("[info] No Airtable records to export.")
+        print("[info] No qualified leads found; no Excel export generated.")
 
     counts = {}
 

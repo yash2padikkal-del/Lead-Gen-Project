@@ -113,7 +113,8 @@ def style_sheet(ws):
 
     ws.freeze_panes = "A2"
 
-    ws.auto_filter.ref = ws.dimensions
+    # Excel Table objects provide their own AutoFilter; do not add a
+    # second overlapping worksheet-level AutoFilter here.
 
     ws.row_dimensions[1].height = 28
 
