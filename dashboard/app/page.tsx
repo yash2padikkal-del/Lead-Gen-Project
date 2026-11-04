@@ -16,6 +16,18 @@ type Lead = {
 
 type Tab = "Overview" | "Leads" | "Discover" | "Analytics";
 
+type SearchRun = {
+  requestId: string;
+  keyword: string;
+  searchLimit: string;
+  status: "queued" | "in_progress" | "completed" | "failed";
+  message: string;
+  createdAt: string;
+  runUrl?: string;
+  artifactAvailable?: boolean;
+  artifactId?: number | null;
+};
+
 export default function Home() {
   const [activeTab, setActiveTab] = useState<Tab>("Overview");
   const [leads, setLeads] = useState<Lead[]>([]);
@@ -25,7 +37,91 @@ export default function Home() {
   const [searchLimit, setSearchLimit] = useState("25");
   const [searching, setSearching] = useState(false);
   const [searchMessage, setSearchMessage] = useState("");
+  const [searchHistory, setSearchHistory] = useState<SearchRun[]>([]);
   const [selectedLead, setSelectedLead] = useState<Lead | null>(null);
+
+  // Restore this browser session's search history.
+  useEffect(() => {
+    try {
+      const saved = sessionStorage.getItem("leadgen-search-history");
+      if (saved) setSearchHistory(JSON.parse(saved) as SearchRun[]);
+    } catch (error) {
+      console.error("Could not restore search history:", error);
+    }
+  }, []);
+
+  // Keep the history scoped to the current browser tab session.
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(
+        "leadgen-search-history",
+        JSON.stringify(searchHistory)
+      );
+    } catch (error) {
+      console.error("Could not save search history:", error);
+    }
+  }, [searchHistory]);
+
+  // Poll GitHub Actions for every search that is still queued or running.
+  useEffect(() => {
+    const activeRuns = searchHistory.filter(
+      (run) => run.status === "queued" || run.status === "in_progress"
+    );
+    if (activeRuns.length === 0) return;
+
+    let cancelled = false;
+
+    const checkRuns = async () => {
+      await Promise.all(
+        activeRuns.map(async (run) => {
+          try {
+            const response = await fetch(
+              `/api/search-status?requestId=${encodeURIComponent(run.requestId)}`,
+              { cache: "no-store" }
+            );
+            const data = await response.json();
+            if (!response.ok || !data.success || cancelled) return;
+
+            const nextStatus =
+              data.status === "completed" || data.status === "failed"
+                ? data.status
+                : data.status === "in_progress"
+                  ? "in_progress"
+                  : "queued";
+
+            setSearchHistory((current) =>
+              current.map((item) =>
+                item.requestId === run.requestId
+                  ? {
+                      ...item,
+                      status: nextStatus,
+                      message: data.message || item.message,
+                      runUrl: data.runUrl || item.runUrl,
+                      artifactAvailable: Boolean(data.artifactAvailable),
+                      artifactId: data.artifactId ?? item.artifactId ?? null,
+                    }
+                  : item
+              )
+            );
+
+            if (nextStatus === "completed") {
+              fetchLeads();
+            }
+          } catch (error) {
+            console.error("Search status check failed:", error);
+          }
+        })
+      );
+    };
+
+    checkRuns();
+    const timer = window.setInterval(checkRuns, 10000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [searchHistory]);
 
   async function fetchLeads() {
     try {
@@ -63,9 +159,17 @@ export default function Home() {
         throw new Error(data.error || "Unable to start search.");
       }
 
-      setSearchMessage(
-        "Search successfully submitted! Your GitHub Actions workflow has been triggered."
-      );
+      const newRun: SearchRun = {
+        requestId: data.requestId,
+        keyword: keyword.trim(),
+        searchLimit,
+        status: "queued",
+        message: "Waiting for GitHub Actions to start.",
+        createdAt: new Date().toISOString(),
+      };
+
+      setSearchHistory((current) => [newRun, ...current]);
+      setSearchMessage("Search queued successfully. You can track its progress below.");
       setKeyword("");
     } catch (error) {
       setSearchMessage(
@@ -397,6 +501,85 @@ export default function Home() {
                     {searchMessage}
                   </div>
                 )}
+
+                <div className="mt-10 border-t border-[#e9e3dc] pt-7">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-xl font-bold">Search activity</h3>
+                      <p className="mt-1 text-sm text-[#888]">
+                        Live status and exports from this browser session.
+                      </p>
+                    </div>
+                    {searchHistory.length > 0 && (
+                      <span className="rounded-full bg-[#ffe1ed] px-3 py-1.5 text-xs font-bold text-[#e91e70]">
+                        {searchHistory.length} {searchHistory.length === 1 ? "search" : "searches"}
+                      </span>
+                    )}
+                  </div>
+
+                  {searchHistory.length === 0 ? (
+                    <div className="mt-5 rounded-2xl bg-[#f8f5ef] p-5 text-sm text-[#888]">
+                      Your searches will appear here once you start one.
+                    </div>
+                  ) : (
+                    <div className="mt-5 space-y-3">
+                      {searchHistory.map((run) => (
+                        <div
+                          key={run.requestId}
+                          className="rounded-2xl border border-[#e9e3dc] bg-white p-5"
+                        >
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <p className="break-words font-bold">{run.keyword}</p>
+                              <p className="mt-1 text-xs text-[#999]">
+                                Up to {run.searchLimit} brands · {new Date(run.createdAt).toLocaleString()}
+                              </p>
+                            </div>
+                            <span
+                              className={`rounded-full px-3 py-1.5 text-xs font-bold ${
+                                run.status === "completed"
+                                  ? "bg-[#e2f3fc] text-[#174e70]"
+                                  : run.status === "failed"
+                                    ? "bg-[#ffe1ed] text-[#e91e70]"
+                                    : "bg-[#f8f5ef] text-[#777]"
+                              }`}
+                            >
+                              {run.status === "in_progress"
+                                ? "RUNNING"
+                                : run.status.toUpperCase()}
+                            </span>
+                          </div>
+                          <p className="mt-3 text-sm text-[#777]">{run.message}</p>
+                          <div className="mt-4 flex flex-wrap gap-3">
+                            {run.artifactAvailable && run.artifactId && (
+                              <a
+                                href={`/api/download/${run.artifactId}`}
+                                className="rounded-full bg-[#f52880] px-5 py-2.5 text-xs font-bold text-white transition hover:bg-[#db1768]"
+                              >
+                                Download Excel ↓
+                              </a>
+                            )}
+                            {run.runUrl && (
+                              <a
+                                href={run.runUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="rounded-full bg-[#e2f3fc] px-5 py-2.5 text-xs font-bold text-[#174e70] hover:bg-[#cceafb]"
+                              >
+                                View GitHub run ↗
+                              </a>
+                            )}
+                            {run.status === "completed" && !run.artifactAvailable && (
+                              <span className="text-xs text-[#999]">
+                                No Excel export was produced for this search.
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
 
               <div className="rounded-[28px] bg-[#a9dcf5] p-8 text-[#174e70]">

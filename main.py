@@ -1,75 +1,90 @@
 """
 Streetwear Lead-Gen Monitor
-REMINDER: REDDIT NOT WORKING - PLAYWRIGHT NEEDED
 
-Scheduled runs use the default keyword list and configured RSS feeds.
-Manual GitHub Actions runs can supply SEARCH_KEYWORD to run a targeted
-Meta Ad Library search. Every lead is tagged with a Search ID and keyword
-so the dashboard can show the results of an individual search.
+Playwright Meta Ad Library
+    -> Advertiser aggregation
+    -> Enrichment pipeline
+    -> ANN inference
+    -> Airtable
+
+No deterministic priority scoring.
+Incomplete leads remain pending_enrichment.
 """
 
+import json
 import os
 import re
+import subprocess
 import sys
 import time
-import json
 import uuid
-import feedparser
+
+from pathlib import Path
+from urllib.parse import urlparse
+
 import requests
-from urllib.parse import urljoin, urlparse
-from bs4 import BeautifulSoup
-from groq import Groq
 from dotenv import load_dotenv
 
-load_dotenv()  # reads .env into environment variables for local runs
+from excel_export import export_to_excel
 
-# ---------------------------------------------------------------------------
-# Config (set these as GitHub Actions secrets / local .env vars, never commit)
-# ---------------------------------------------------------------------------
+load_dotenv()
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+ROOT = Path(__file__).resolve().parent
+
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
+
 AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE_NAME = os.environ.get("AIRTABLE_TABLE_NAME", "Leads")
 
-METAPI_API_KEY = os.environ.get("METAPI_API_KEY")
-METAPI_BASE_URL = "https://api.metapi.io/v1"
+AIRTABLE_TABLE_NAME = os.environ.get(
+    "AIRTABLE_TABLE_NAME",
+    "Leads"
+)
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-_groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-GROQ_MODEL = "openai/gpt-oss-120b"
+SCRAPER_REPO = Path(os.environ.get(
+    "FACEBOOK_SCRAPER_DIR",
+    ROOT.parent / "facebook-ads-scraper"
+))
 
-# GitHub Actions supplies these for dashboard-triggered searches.
-CUSTOM_KEYWORD = os.environ.get("SEARCH_KEYWORD", "").strip()
-SEARCH_ID = os.environ.get("SEARCH_ID", "").strip() or str(uuid.uuid4())
+SCRAPER_SCRIPT = Path(os.environ.get(
+    "FACEBOOK_SCRAPER_SCRIPT",
+    SCRAPER_REPO / "playwright_scraper.py"
+))
 
-# Maximum number of unique Ad Library brands to process per run.
-# The dashboard will pass one of these supported values.
-ALLOWED_SEARCH_LIMITS = (10, 25, 50, 100)
-try:
-    SEARCH_LIMIT = int(os.environ.get("SEARCH_LIMIT", "25"))
-except (TypeError, ValueError):
-    SEARCH_LIMIT = 25
+SCRAPER_OUTPUT = SCRAPER_REPO / "facebook_ads.json"
 
-if SEARCH_LIMIT not in ALLOWED_SEARCH_LIMITS:
-    print(
-        f"[warn] unsupported SEARCH_LIMIT={SEARCH_LIMIT}; defaulting to 25"
+SCRAPER_REGION = os.environ.get(
+    "FACEBOOK_SCRAPER_REGION",
+    "IN"
+).strip().upper()
+
+SCRAPER_TIMEOUT = int(
+    os.environ.get(
+        "FACEBOOK_SCRAPER_TIMEOUT",
+        "1800"
     )
-    SEARCH_LIMIT = 25
+)
 
-# Google Alerts RSS feed URLs — create these at google.com/alerts, set delivery
-# to "RSS feed", and paste the feed URLs here (one per query you set up).
-RSS_FEEDS = [
-    # "https://www.google.com/alerts/feeds/XXXXXXXXXXXXX/XXXXXXXXXXXXX",
-]
+SCRAPER_MAX_ADS_PER_KEYWORD = int(
+    os.environ.get(
+        "SCRAPER_MAX_ADS_PER_KEYWORD",
+        "0"
+    ) or 0
+)
 
-# Keywords that bump an RSS lead's score up
-POSITIVE_KEYWORDS = [
-    "new drop", "launch", "launching", "streetwear", "collab",
-    "collection", "just dropped", "restock", "limited edition",
-    "brand new", "startup", "clothing brand", "apparel brand",
-]
+CUSTOM_KEYWORD = os.environ.get(
+    "SEARCH_KEYWORD",
+    ""
+).strip()
 
-# Scheduled Meta Ad Library searches. A dashboard-triggered manual search
-# replaces this list with the one keyword supplied by the user.
+SEARCH_ID = (
+    os.environ.get("SEARCH_ID", "").strip()
+    or str(uuid.uuid4())
+)
+
 DEFAULT_AD_LIBRARY_KEYWORDS = [
     "streetwear brand",
     "clothing label",
@@ -84,532 +99,1191 @@ AD_LIBRARY_KEYWORDS = (
     else DEFAULT_AD_LIBRARY_KEYWORDS
 )
 
-# Follower-count disqualification rule
-FOLLOWER_DISQUALIFY_THRESHOLD = 10000
+SEARCH_KEYWORD_FOR_RECORDS = (
+    CUSTOM_KEYWORD
+    or ", ".join(AD_LIBRARY_KEYWORDS)
+)
 
-# ---------------------------------------------------------------------------
-# Signal collection — RSS
-# ---------------------------------------------------------------------------
-
-def fetch_rss_signals():
-    """Pull entries from configured Google Alerts RSS feeds."""
-    signals = []
-    for feed_url in RSS_FEEDS:
-        if not feed_url.strip():
-            continue
-        parsed = feedparser.parse(feed_url)
-        for entry in parsed.entries:
-            signals.append({
-                "source": "RSS",
-                "title": entry.get("title", ""),
-                "summary": strip_html(entry.get("summary", "")),
-                "link": entry.get("link", ""),
-            })
-    return signals
-
-
-def strip_html(text):
-    return re.sub(r"<[^>]+>", "", text or "").strip()
-
-# ---------------------------------------------------------------------------
-# Signal collection — Meta Ad Library (via Metapi)
-# ---------------------------------------------------------------------------
-
-def fetch_ad_library_signals():
-    """Fetch Meta Ad Library ads through Metapi and deduplicate by brand."""
-    if not METAPI_API_KEY:
-        raise RuntimeError("METAPI_API_KEY is missing; add it to your local .env or GitHub secrets.")
-
-    headers = {
-        "Authorization": f"Bearer {METAPI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    brands = {}
-
-    # Metapi's count is the number of ads, not unique brands. Fetch a bounded
-    # pool, then the main pipeline applies SEARCH_LIMIT to unique brands.
-    ad_count = max(100, SEARCH_LIMIT * 10)
-
-    for keyword in AD_LIBRARY_KEYWORDS:
-        print(f"[info] fetching Ad Library results for: '{keyword}'")
-        try:
-            create_response = requests.post(
-                f"{METAPI_BASE_URL}/tasks",
-                headers=headers,
-                json={
-                    "q": keyword,
-                    "country": "IN",
-                    "count": ad_count,
-                    "active_status": "active",
-                    "ad_type": "all",
-                    "search_type": "keyword_unordered",
-                    "sort_data": {
-                        "mode": "relevancy_monthly_grouped",
-                        "direction": "desc",
-                    },
-                },
-                timeout=30,
-            )
-            create_response.raise_for_status()
-            task_id = create_response.json().get("task_id")
-            if not task_id:
-                raise RuntimeError(f"Metapi did not return a task_id: {create_response.text[:500]}")
-
-            # Wait for Metapi to finish processing the search task.
-            deadline = time.time() + 600
-            status = "running"
-            while time.time() < deadline:
-                status_response = requests.get(
-                    f"{METAPI_BASE_URL}/tasks/{task_id}/status",
-                    headers=headers,
-                    timeout=30,
-                )
-                status_response.raise_for_status()
-                status_data = status_response.json()
-                status = status_data.get("status", "running")
-                print(
-                    f"[info] Metapi task {task_id}: {status} "
-                    f"({status_data.get('progress_percent', 0)}%)"
-                )
-                if status in {"succeeded", "failed", "timed_out", "aborted"}:
-                    break
-                time.sleep(5)
-
-            if status != "succeeded":
-                detail = status_data.get("error_message", "") if "status_data" in locals() else ""
-                raise RuntimeError(f"Metapi task ended with status '{status}'. {detail}")
-
-            offset = 0
-            page_size = 500
-            while True:
-                results_response = requests.get(
-                    f"{METAPI_BASE_URL}/tasks/{task_id}/results",
-                    headers=headers,
-                    params={"offset": offset, "limit": page_size},
-                    timeout=60,
-                )
-                results_response.raise_for_status()
-                result_payload = results_response.json()
-                items = result_payload.get("data", [])
-
-                for item in items:
-                    page_name = (item.get("provider_page_name") or "").strip()
-                    if not page_name:
-                        continue
-
-                    page_id = item.get("provider_page_id")
-                    brand_key = str(page_id) if page_id else page_name.casefold()
-                    page_profile_url = (
-                        f"https://www.facebook.com/{page_id}" if page_id else None
-                    )
-
-                    if brand_key not in brands:
-                        brands[brand_key] = {
-                            "source": "Ad Library",
-                            "page_name": page_name,
-                            "page_profile_url": page_profile_url,
-                            "matched_keywords": set(),
-                            "ads": [],
-                        }
-
-                    brand = brands[brand_key]
-                    brand["matched_keywords"].add(keyword)
-                    bodies = item.get("bodies") or []
-                    if isinstance(bodies, str):
-                        bodies = [bodies]
-                    body_text = " ".join(str(body) for body in bodies if body)
-
-                    brand["ads"].append({
-                        "ad_archive_id": item.get("provider_id"),
-                        "body_text": body_text,
-                        "cta_text": item.get("cta_text"),
-                        "link_url": item.get("link_url"),
-                    })
-
-                pagination = result_payload.get("pagination", {})
-                if not pagination.get("has_more") or not items:
-                    break
-                offset += len(items)
-
-        except (requests.RequestException, ValueError, RuntimeError) as exc:
-            print(
-                f"[warn] Metapi search failed for '{keyword}': {exc}",
-                file=sys.stderr,
-            )
-            continue
-
-    for brand in brands.values():
-        brand["matched_keywords"] = sorted(brand["matched_keywords"])
-        brand["ad_count"] = len(brand["ads"])
-
-    print(
-        f"[info] found {len(brands)} unique brands across "
-        f"{len(AD_LIBRARY_KEYWORDS)} keyword(s)"
-    )
-    return list(brands.values())
-
-# ---------------------------------------------------------------------------
-# Contact enrichment — website phone number check
-# ---------------------------------------------------------------------------
-
-SOCIAL_DOMAINS = {
-    "facebook.com", "instagram.com", "wa.me", "api.whatsapp.com",
-    "play.google.com", "apps.apple.com", "youtube.com", "linkedin.com",
-    "twitter.com", "x.com", "m.me",
+APPAREL_TERMS = {
+    "apparel",
+    "clothing",
+    "streetwear",
+    "fashion",
+    "hoodie",
+    "hoodies",
+    "t-shirt",
+    "tshirt",
+    "tee",
+    "tees",
+    "shirt",
+    "shirts",
+    "trousers",
+    "pants",
+    "jeans",
+    "denim",
+    "sweatshirt",
+    "jacket",
+    "collection",
+    "clothing brand",
+    "fashion brand",
 }
 
-PHONE_REGEX = re.compile(r"(?:\+91[\-\s]?)?[6-9]\d{9}\b")
-CONTACT_PAGE_HINTS = ["contact", "about", "reach", "support", "get-in-touch"]
-MAX_PAGES_PER_SITE = 6
-PHONE_FOUND_SCORE_BOOST = 20
+SOCIAL_HOSTS = {
+    "facebook.com",
+    "fb.me",
+    "instagram.com",
+    "wa.me",
+    "whatsapp.com",
+    "youtube.com",
+    "linkedin.com",
+    "twitter.com",
+    "x.com",
+    "tiktok.com",
+    "pinterest.com",
+    "threads.net",
+    "m.me",
+    "play.google.com",
+    "apps.apple.com",
+    "share.google",
+    "google.com",
+    "linktr.ee",
+    "bit.ly",
+    "tinyurl.com",
+    "t.co",
+}
+
+UNSUITABLE_HOSTS = {
+    "amazon.in",
+    "amazon.com",
+    "flipkart.com",
+    "myntra.com",
+    "ajio.com",
+    "meesho.com",
+    "temu.com",
+    "etsy.com",
+    "culture-circle.com",
+    "culturecircle.com",
+}
 
 
-def extract_candidate_website(signal):
-    """Find a non-social website linked from a brand's ads."""
-    for ad in signal.get("ads", []):
-        link = ad.get("link_url") or ""
-        if not link:
-            continue
-        parsed = urlparse(link)
-        domain = parsed.netloc.replace("www.", "")
-        if domain and not any(social in domain for social in SOCIAL_DOMAINS):
-            return f"{parsed.scheme}://{parsed.netloc}"
-    return None
+# ============================================================
+# SCRAPER
+# ============================================================
+
+def scraper_python():
+
+    candidates = [
+
+        SCRAPER_REPO / ".venv" / "Scripts" / "python.exe",
+
+        SCRAPER_REPO / ".venv" / "bin" / "python",
+
+    ]
+
+    for path in candidates:
+
+        if path.exists():
+
+            return str(path)
+
+    return sys.executable
 
 
-def find_phone_number_on_website(base_url):
-    """Check a homepage and likely contact pages for an Indian phone number."""
-    visited = set()
-    to_visit = [base_url]
-    pages_checked = 0
+def run_scraper(max_ads):
 
-    while to_visit and pages_checked < MAX_PAGES_PER_SITE:
-        url = to_visit.pop(0)
-        if url in visited:
-            continue
-        visited.add(url)
-        pages_checked += 1
+    if not SCRAPER_SCRIPT.is_file():
+
+        raise FileNotFoundError(
+            f"Facebook scraper not found: {SCRAPER_SCRIPT}"
+        )
+
+    collected = []
+
+    seen_ids = set()
+
+    for keyword in AD_LIBRARY_KEYWORDS:
+
+        print(f"[info] Scraping: {keyword}")
+
+        command = [
+
+            scraper_python(),
+
+            str(SCRAPER_SCRIPT),
+
+            "--query",
+            keyword,
+
+            "--region",
+            SCRAPER_REGION,
+
+            "--max-results",
+            str(max_ads),
+
+            "--details",
+
+        ]
 
         try:
-            resp = requests.get(
-                url,
-                timeout=10,
-                headers={"User-Agent": "Mozilla/5.0"},
+
+            completed = subprocess.run(
+
+                command,
+
+                cwd=str(SCRAPER_REPO),
+
+                capture_output=True,
+
+                text=True,
+
+                timeout=SCRAPER_TIMEOUT,
+
+                check=False,
+
             )
-            resp.raise_for_status()
-        except requests.RequestException:
+
+        except subprocess.TimeoutExpired:
+
+            print(
+                f"[warn] Scraper timed out: {keyword}"
+            )
+
             continue
 
-        html = resp.text
+        if completed.stdout:
 
-        tel_match = re.search(r'tel:([+\d][\d\-\s]{7,})', html)
-        if tel_match:
-            return tel_match.group(1).strip()
+            print(completed.stdout[-2500:])
 
-        text_match = PHONE_REGEX.search(html)
-        if text_match:
-            return text_match.group(0).strip()
+        if completed.returncode != 0:
 
-        if url == base_url:
-            try:
-                soup = BeautifulSoup(html, "html.parser")
-                for anchor in soup.find_all("a", href=True):
-                    full_url = urljoin(base_url, anchor["href"])
-                    if urlparse(full_url).netloc != urlparse(base_url).netloc:
-                        continue
-                    if any(hint in anchor["href"].lower() for hint in CONTACT_PAGE_HINTS):
-                        if full_url not in visited and full_url not in to_visit:
-                            to_visit.append(full_url)
-            except Exception:
-                pass
+            print(
+                f"[warn] Scraper failed: "
+                f"{completed.stderr[-2000:]}"
+            )
 
-    return None
+            continue
 
-# ---------------------------------------------------------------------------
-# Follower count check (Instagram/Facebook profile page, best-effort)
-# ---------------------------------------------------------------------------
+        if not SCRAPER_OUTPUT.exists():
 
-def _parse_follower_string(raw):
-    """Convert strings like '12,345', '12.3K', '1.2M' into an integer."""
-    raw = raw.strip().upper().replace(",", "")
-    multiplier = 1
-    if raw.endswith("K"):
-        multiplier = 1_000
-        raw = raw[:-1]
-    elif raw.endswith("M"):
-        multiplier = 1_000_000
-        raw = raw[:-1]
-    elif raw.endswith("B"):
-        multiplier = 1_000_000_000
-        raw = raw[:-1]
-    try:
-        return int(float(raw) * multiplier)
-    except ValueError:
-        return None
+            print(
+                "[warn] Scraper output not found."
+            )
 
+            continue
 
-def get_follower_count(profile_url):
-    """Best-effort follower extraction; None means unknown, not zero."""
-    if not profile_url:
-        return None
+        try:
 
-    try:
-        resp = requests.get(
-            profile_url,
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"},
+            with open(
+                SCRAPER_OUTPUT,
+                "r",
+                encoding="utf-8"
+            ) as file:
+
+                ads = json.load(file)
+
+        except (OSError, json.JSONDecodeError) as error:
+
+            print(
+                f"[warn] Could not read scraper output: {error}"
+            )
+
+            continue
+
+        if not isinstance(ads, list):
+            continue
+
+        new_count = 0
+
+        for raw_ad in ads:
+
+            if not isinstance(raw_ad, dict):
+                continue
+
+            ad = dict(raw_ad)
+
+            ad_id = str(
+                ad.get("ad_id") or ""
+            ).strip()
+
+            if ad_id and ad_id in seen_ids:
+                continue
+
+            if ad_id:
+                seen_ids.add(ad_id)
+
+            ad["_matched_keyword"] = keyword
+
+            collected.append(ad)
+
+            new_count += 1
+
+        print(
+            f"[info] Added {new_count} unique ads."
         )
-        resp.raise_for_status()
-    except requests.RequestException:
-        return None
 
-    match = re.search(r"([\d,.]+[KMB]?)\s*Followers", resp.text, re.IGNORECASE)
-    if match:
-        return _parse_follower_string(match.group(1))
+    if not collected:
 
-    return None
+        return [], None
 
-# ---------------------------------------------------------------------------
-# Scoring — LLM contextual judge (Groq)
-# ---------------------------------------------------------------------------
+    data_dir = ROOT / "data"
 
-JUDGE_SYSTEM_PROMPT = """You are a lead-qualification judge for a marketing agency \
-that pitches its services to small and mid-sized apparel/streetwear brands in India.
-
-Given a Facebook/Instagram page name and its ad copy, decide if this is a \
-GOOD LEAD: a genuine small-to-mid apparel, streetwear, or fashion brand that \
-would plausibly hire a marketing agency.
-
-Disqualify:
-- Large, well-known platforms or retailers (e.g. AJIO, Myntra, Amazon, Flipkart, \
-Nykaa) — too big to be a prospect
-- Marketing/ad agencies, photography studios, or other service providers to brands \
-(they're vendors or competitors, not leads)
-- Wholesalers/manufacturers selling B2B, not direct-to-consumer brands
-- Ads unrelated to apparel (fiction/app-install ads, unrelated products) that only \
-matched a search keyword by coincidence
-- Hiring/recruitment posts
-
-Respond with ONLY a JSON object, no other text, in this exact shape:
-{"is_good_lead": true or false, "score": 0-100, "reason": "one sentence explaining why"}
-"""
-
-
-def judge_brand_with_llm(signal):
-    """Score an Ad Library brand with Groq; return (score, reasons)."""
-    ad_texts = "\n---\n".join(
-        ad.get("body_text", "")[:1000]
-        for ad in signal.get("ads", [])
-    )[:5000]
-
-    user_content = (
-        f"Page name: {signal.get('page_name')}\n\n"
-        f"Ad copy:\n{ad_texts}"
+    data_dir.mkdir(
+        parents=True,
+        exist_ok=True
     )
 
-    try:
-        response = _groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.2,
+    raw_path = (
+        data_dir
+        / f"facebook_ads_{SEARCH_ID}.json"
+    )
+
+    with open(
+        raw_path,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            collected,
+            file,
+            ensure_ascii=False,
+            indent=2
         )
-        raw_text = response.choices[0].message.content.strip()
-        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-        verdict = json.loads(raw_text)
 
-        score = int(verdict.get("score", 0))
-        reason = verdict.get("reason", "no reason given")
-        if not verdict.get("is_good_lead", False):
-            score = 0
+    from enrichment.providers.facebook_ads_library import (
+        FacebookAdsLibraryProvider
+    )
 
-        return score, [f"LLM judge: {reason}"]
+    provider = FacebookAdsLibraryProvider(
+        json_paths=[raw_path]
+    )
 
-    except Exception as e:
-        print(
-            f"[warn] LLM judge failed for '{signal.get('page_name')}': {e}",
-            file=sys.stderr,
+    return provider.get_advertisers(), raw_path
+
+
+# ============================================================
+# ADVERTISER PROCESSING
+# ============================================================
+
+def candidate_website(advertiser):
+
+    """Return a plausible first-party website candidate."""
+
+    for ad in advertiser.get("ads", []):
+
+        raw_url = str(
+            ad.get("link_url") or ""
+        ).strip()
+
+        if not raw_url:
+            continue
+
+        if not raw_url.startswith(
+            ("http://", "https://")
+        ):
+
+            raw_url = "https://" + raw_url
+
+        try:
+
+            parsed = urlparse(raw_url)
+
+            host = (
+                parsed.hostname or ""
+            ).lower().removeprefix("www.")
+
+        except ValueError:
+
+            continue
+
+        if not host or "." not in host:
+            continue
+
+        blocked_hosts = (
+            SOCIAL_HOSTS | UNSUITABLE_HOSTS
         )
-        return 0, [f"LLM judge failed: {e}"]
 
+        if any(
+            host == blocked or host.endswith("." + blocked)
+            for blocked in blocked_hosts
+        ):
 
-def score_signal(signal):
-    """Use Groq for Ad Library brands and rules for RSS signals."""
-    if signal["source"] == "Ad Library":
-        if not _groq_client:
-            print("[info] GROQ_API_KEY not set — scoring 0.")
-            return 0, ["GROQ_API_KEY not set, cannot judge"]
-        score, reasons = judge_brand_with_llm(signal)
-        reasons.append(
-            f"(info, not scored) ad volume: {signal.get('ad_count', 0)} active ad(s)"
+            continue
+
+        if host in {
+
+            "goo.gl",
+            "forms.gle",
+            "g.page",
+            "fb.me",
+            "lnk.bio",
+            "bio.site",
+            "beacons.ai",
+            "taplink.cc",
+            "onelink.me",
+            "apps.shopify.com",
+
+        }:
+
+            continue
+
+        if parsed.scheme not in {
+            "http",
+            "https"
+        }:
+
+            continue
+
+        return (
+            f"{parsed.scheme}://{parsed.netloc}"
         )
-        return score, reasons
 
-    text = f"{signal.get('title', '')} {signal.get('summary', '')}".lower()
-    score = 0
-    reasons = []
-    matched = [keyword for keyword in POSITIVE_KEYWORDS if keyword in text]
+    return None
 
-    if matched:
-        bump = min(40, len(matched) * 10)
-        score += bump
-        reasons.append(f"keyword match ({', '.join(matched[:3])}): +{bump}")
 
-    if signal["source"] == "RSS":
-        score += 15
-        reasons.append("Google Alert match (curated query): +15")
+def classify_apparel_brand(advertiser):
+    """
+    Conservative apparel classification.
 
-    return max(0, min(100, score)), reasons
+    True:
+        Positive apparel evidence.
 
-# ---------------------------------------------------------------------------
-# Airtable write
-# ---------------------------------------------------------------------------
+    False:
+        Strong evidence of a non-apparel business.
 
-def write_to_airtable(leads):
-    if not leads:
-        print("[info] no leads passed the score threshold; nothing to write")
-        return
+    None:
+        Insufficient evidence.
+    """
 
-    if not (AIRTABLE_API_KEY and AIRTABLE_BASE_ID and AIRTABLE_TABLE_NAME):
-        print("[error] Airtable configuration missing; cannot save leads.", file=sys.stderr)
-        raise RuntimeError("Airtable configuration missing")
+    brand_name = str(
+        advertiser.get("brand_name") or ""
+    ).lower()
 
-    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
-    headers = {
-        "Authorization": f"Bearer {AIRTABLE_API_KEY}",
-        "Content-Type": "application/json",
+    ads = advertiser.get("ads", []) or []
+
+    ad_bodies = [
+        str(
+            ad.get("body")
+            or ad.get("body_text")
+            or ""
+        ).lower()
+        for ad in ads
+    ]
+
+    combined = " ".join([
+        brand_name,
+        *ad_bodies,
+    ])
+
+    # Explicit non-apparel indicators.
+    negative_phrases = (
+        "billing software",
+        "erp software",
+        "enterprise resource planning",
+        "packaging solutions",
+        "packaging supplier",
+        "sewing machine",
+        "embroidery machine",
+        "travel booking",
+        "fantasy game",
+        "mobile game",
+        "cosmetics",
+        "skincare",
+        "wholesale supplier",
+        "manufacturer for brands",
+        "resale marketplace",
+        "pre-owned marketplace",
+        "multi-brand marketplace",
+    )
+
+    if any(
+        phrase in combined
+        for phrase in negative_phrases
+    ):
+        return False
+
+    # Categories are useful positive evidence.
+    categories = []
+
+    for ad in ads:
+
+        raw = ad.get(
+            "advertiser_categories_json"
+        )
+
+        if isinstance(raw, str):
+
+            try:
+                raw = json.loads(raw)
+
+            except json.JSONDecodeError:
+                raw = []
+
+        if isinstance(raw, list):
+
+            categories.extend(
+                str(item).lower()
+                for item in raw
+            )
+
+    apparel_categories = {
+        "clothing",
+        "apparel",
+        "clothing store",
+        "clothing brand",
+        "fashion designer",
     }
 
-    for i in range(0, len(leads), 10):
-        batch = leads[i:i + 10]
-        payload = {
-            "records": [{"fields": lead} for lead in batch],
-            "typecast": True,
-        }
-
-        try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=30)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"[error] Airtable write failed: {e}", file=sys.stderr)
-            if getattr(e, "response", None) is not None:
-                print(e.response.text, file=sys.stderr)
-            raise
-
-        print(f"[ok] wrote {len(batch)} leads to Airtable")
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    if CUSTOM_KEYWORD:
-        print(f"[info] targeted search requested: {CUSTOM_KEYWORD}")
-        # A manual keyword search should preview only results for that keyword;
-        # unrelated RSS results are therefore excluded from this run.
-        rss_signals = []
-        search_keyword_for_records = CUSTOM_KEYWORD
-    else:
-        print("[info] scheduled/default discovery run")
-        rss_signals = fetch_rss_signals()
-        search_keyword_for_records = ", ".join(AD_LIBRARY_KEYWORDS)
-
-    # Apply the requested cap after fetch_ad_library_signals() has deduplicated
-    # results by page_name, so the limit represents unique brands, not ads.
-    all_ad_library_signals = fetch_ad_library_signals()
-    ad_library_signals = all_ad_library_signals[:SEARCH_LIMIT]
-
-    print(
-        f"[info] processing {len(ad_library_signals)} of "
-        f"{len(all_ad_library_signals)} unique Ad Library brands "
-        f"(limit: {SEARCH_LIMIT})"
+    category_evidence = any(
+        category.strip() in apparel_categories
+        for category in categories
     )
 
-    signals = rss_signals + ad_library_signals
-    print(f"[info] search ID: {SEARCH_ID}")
-    print(f"[info] collected {len(signals)} raw signals")
+    # Strong product-specific signals.
+    product_terms = (
+        "streetwear",
+        "hoodie",
+        "hoodies",
+        "t-shirt",
+        "tshirt",
+        "oversized tee",
+        "graphic tee",
+        "sweatshirt",
+        "denim",
+        "jeans",
+        "trousers",
+        "jacket",
+        "clothing collection",
+        "apparel collection",
+        "new collection",
+        "drop is live",
+        "shop the collection",
+    )
 
-    leads = []
+    product_evidence = any(
+        re.search(
+            r"\b" + re.escape(term) + r"\b",
+            combined
+        )
+        for term in product_terms
+    )
 
-    for signal in signals:
-        score, reasons = score_signal(signal)
+    # A category by itself can be ambiguous.
+    # A product-specific advertisement is stronger evidence.
+    if category_evidence or product_evidence:
+        return True
 
-        if signal["source"] == "Ad Library":
-            # Stay comfortably under Groq's 30 requests/minute free-tier limit.
-            time.sleep(2.1)
+    return None
 
-        if score < 25:
-            continue
+def normalise_advertiser(advertiser, website):
 
-        phone_number = None
-        follower_count = None
+    handle = advertiser.get(
+        "instagram_handle"
+    )
 
-        if signal["source"] == "Ad Library":
-            website = extract_candidate_website(signal)
-            if website:
-                print(
-                    f"[info] checking {website} for a phone number "
-                    f"({signal['page_name']})"
+    if isinstance(handle, str):
+
+        handle = handle.strip()
+
+        if handle.startswith(
+            "https://www.instagram.com/"
+        ) or handle.startswith(
+            "https://instagram.com/"
+        ):
+
+            handle = (
+                handle.rstrip("/")
+                .split("/")[-1]
+            )
+
+        handle = handle.lstrip("@") or None
+
+    matched_keywords = sorted({
+
+        ad.get("_matched_keyword")
+
+        for ad in advertiser.get("ads", [])
+
+        if ad.get("_matched_keyword")
+
+    })
+
+    return {
+
+        "brand_name": str(
+            advertiser.get("brand_name") or ""
+        ).strip(),
+
+        "website": website,
+
+        "instagram_handle": handle,
+
+        "instagram_followers": advertiser.get(
+            "followers"
+        ),
+
+        "is_apparel_brand": classify_apparel_brand(
+            advertiser
+        ),
+
+        "facebook_url": advertiser.get(
+            "facebook_url"
+        ),
+
+        "facebook_page_id": advertiser.get(
+            "page_id"
+        ),
+
+        "matched_keywords": matched_keywords,
+
+        "ads": advertiser.get("ads", []),
+
+    }
+
+
+# ============================================================
+# PIPELINE
+# ============================================================
+
+def build_pipeline(provider):
+
+    from enrichment.pipeline import (
+        LeadGenerationPipeline
+    )
+
+    return LeadGenerationPipeline(
+
+        social_provider=provider,
+
+        advertising_provider=provider,
+
+        brand_metadata_provider=None,
+
+    )
+
+
+# ============================================================
+# AIRTABLE RECORD CONSTRUCTION
+# ============================================================
+
+def first_value(values):
+
+    if isinstance(values, list):
+
+        return (
+            str(values[0]).strip()
+            if values
+            else ""
+        )
+
+    return (
+        str(values).strip()
+        if values
+        else ""
+    )
+
+
+def json_safe(value):
+
+    try:
+
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            default=str
+        )
+
+    except (TypeError, ValueError):
+
+        return str(value)
+
+
+def make_airtable_record(lead, result):
+
+    status = result.get(
+        "status",
+        "unknown"
+    )
+
+    contacts = (
+        result.get("enrichment", {}).get(
+            "contacts",
+            {}
+        )
+    )
+
+    emails = contacts.get(
+        "business_emails",
+        []
+    )
+
+    phones = contacts.get(
+        "business_phones",
+        []
+    )
+
+    contact_info = (
+        first_value(phones)
+        or first_value(emails)
+    )
+
+    if not contact_info:
+
+        contact_info = lead.get(
+            "facebook_url"
+        )
+
+        if (
+            not contact_info
+            and lead.get("instagram_handle")
+        ):
+
+            contact_info = (
+                "https://www.instagram.com/"
+                + lead["instagram_handle"]
+                + "/"
+            )
+
+    ad_sample = ""
+
+    if lead.get("ads"):
+
+        first_ad = lead["ads"][0]
+
+        ad_sample = str(
+            first_ad.get("body")
+            or first_ad.get("body_text")
+            or ""
+        )[:250]
+
+    notes = [
+
+        f"Pipeline status: {status}",
+
+        (
+            "Website candidate from Meta ad destination "
+            "(ownership unverified): "
+            f"{lead.get('website') or 'none'}"
+        ),
+
+        (
+            "Matched search keywords: "
+            + ", ".join(
+                lead.get("matched_keywords", [])
+            )
+        ),
+
+    ]
+
+    if result.get("model_version"):
+
+        notes.append(
+            f"ANN model: {result['model_version']}"
+        )
+
+    if result.get("priority_probability") is not None:
+
+        notes.append(
+            "ANN output (experimental; not a calibrated "
+            "acquisition probability): "
+            f"{result['priority_probability']}"
+        )
+
+    if result.get("missing_features"):
+
+        notes.append(
+            "Missing ANN features: "
+            + ", ".join(
+                result["missing_features"]
+            )
+        )
+
+    if result.get("invalid_features"):
+
+        notes.append(
+            "Invalid ANN features: "
+            + json_safe(
+                result["invalid_features"]
+            )
+        )
+
+    if result.get("imputed_features"):
+
+        notes.append(
+            "ANN imputed features: "
+            + ", ".join(
+                result["imputed_features"]
+            )
+        )
+
+    if result.get("score_quality"):
+
+        notes.append(
+            "ANN score quality: "
+            + result["score_quality"]
+        )
+
+    qualification = result.get(
+        "qualification",
+        {}
+    )
+
+    if qualification.get(
+        "qualification_reasons"
+    ):
+
+        notes.append(
+            "Qualification: "
+            + "; ".join(
+                qualification["qualification_reasons"]
+            )
+        )
+
+    if result.get("errors"):
+
+        notes.append(
+            "Pipeline details: "
+            + "; ".join(
+                map(str, result["errors"])
+            )
+        )
+
+    if ad_sample:
+
+        notes.append(
+            "Sample ad: " + ad_sample
+        )
+
+    return {
+
+        "Lead Name": lead["brand_name"][:100],
+
+        "Company": lead["brand_name"][:100],
+
+        "Lead Source": "Ad Library",
+
+        "Contact Information": contact_info,
+
+        # Only the ANN can populate this field.
+        "Lead Score": (
+            result.get("priority_score")
+            if status == "scored"
+            else None
+        ),
+
+        "Notes": " | ".join(notes)[:9500],
+
+        "Auto-Sourced": True,
+
+        "Search ID": SEARCH_ID,
+
+        "Search Keyword": SEARCH_KEYWORD_FOR_RECORDS,
+
+    }
+
+
+# ============================================================
+# DEBUG OUTPUT
+# ============================================================
+
+def write_debug_results(results):
+
+    data_dir = ROOT / "data"
+
+    data_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    path = (
+        data_dir
+        / f"lead_results_{SEARCH_ID}.json"
+    )
+
+    with open(
+        path,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            results,
+            file,
+            ensure_ascii=False,
+            indent=2,
+            default=str
+        )
+
+    print(
+        f"[ok] Detailed results saved: {path}"
+    )
+
+
+# ============================================================
+# AIRTABLE
+# ============================================================
+
+def write_to_airtable(records):
+
+    if not records:
+
+        print(
+            "[info] No records to save."
+        )
+
+        return
+
+    if not (
+        AIRTABLE_API_KEY
+        and AIRTABLE_BASE_ID
+        and AIRTABLE_TABLE_NAME
+    ):
+
+        raise RuntimeError(
+            "Airtable configuration missing."
+        )
+
+    url = (
+        f"https://api.airtable.com/v0/"
+        f"{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
+    )
+
+    headers = {
+
+        "Authorization": (
+            f"Bearer {AIRTABLE_API_KEY}"
+        ),
+
+        "Content-Type": "application/json",
+
+    }
+
+    for offset in range(
+        0,
+        len(records),
+        10
+    ):
+
+        batch = records[offset:offset + 10]
+
+        payload = {
+
+            "records": [
+                {"fields": record}
+                for record in batch
+            ],
+
+            "typecast": True,
+
+        }
+
+        for attempt in range(5):
+
+            try:
+
+                response = requests.post(
+
+                    url,
+
+                    headers=headers,
+
+                    json=payload,
+
+                    timeout=30
+
                 )
-                phone_number = find_phone_number_on_website(website)
-                if phone_number:
-                    score = min(100, score + PHONE_FOUND_SCORE_BOOST)
-                    reasons.append(
-                        f"phone number found on website (+{PHONE_FOUND_SCORE_BOOST}): "
-                        f"{phone_number}"
+
+                if (
+                    response.status_code == 429
+                    or response.status_code >= 500
+                ):
+
+                    if attempt == 4:
+
+                        response.raise_for_status()
+
+                    retry_after = response.headers.get(
+                        "Retry-After"
                     )
 
-            follower_count = get_follower_count(signal.get("page_profile_url"))
-            if follower_count is not None:
-                reasons.append(f"(info, not scored) followers: {follower_count}")
-                if follower_count > FOLLOWER_DISQUALIFY_THRESHOLD and not phone_number:
-                    print(
-                        f"[info] disqualifying '{signal['page_name']}' — "
-                        f"{follower_count} followers, no phone number found"
+                    wait = (
+
+                        float(retry_after)
+
+                        if retry_after
+
+                        else min(
+                            2 ** attempt,
+                            30
+                        )
+
                     )
+
+                    print(
+                        f"[warn] Airtable returned "
+                        f"{response.status_code}; "
+                        f"retrying in {wait}s"
+                    )
+
+                    time.sleep(wait)
+
                     continue
 
-            sample_ad = signal["ads"][0] if signal.get("ads") else {}
-            contact_info = (
-                phone_number
-                if phone_number
-                else signal.get("page_profile_url", "")
+                response.raise_for_status()
+
+                print(
+                    f"[ok] Wrote {len(batch)} records to Airtable."
+                )
+
+                break
+
+            except requests.RequestException as error:
+
+                if attempt == 4:
+
+                    print(
+                        f"[error] Airtable write failed: {error}"
+                    )
+
+                    if error.response is not None:
+
+                        print(
+                            error.response.text
+                        )
+
+                    raise
+
+                time.sleep(
+                    min(2 ** attempt, 30)
+                )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    configured_limit = os.environ.get(
+        "SEARCH_LIMIT",
+        ""
+    ).strip()
+
+    if configured_limit:
+
+        try:
+            max_ads = int(configured_limit)
+
+            if max_ads <= 0:
+                raise ValueError
+
+        except ValueError:
+            raise ValueError(
+                f"Invalid SEARCH_LIMIT: {configured_limit}. "
+                "Expected a positive integer."
             )
-            lead = {
-                "Lead Name": signal["page_name"][:100],
-                "Company": signal["page_name"][:100],
-                "Lead Source": signal["source"],
-                "Contact Information": contact_info,
-                "Lead Score": score,
-                "Notes": (
-                    " | ".join(reasons)
-                    + f" | matched: {', '.join(signal['matched_keywords'])}"
-                    + f" | sample ad: {sample_ad.get('body_text', '')[:150]}"
-                ),
-                "Auto-Sourced": True,
-            }
-        else:
-            lead = {
-                "Lead Name": signal["title"][:100],
-                "Company": signal["title"][:100],
-                "Lead Source": signal["source"],
-                "Contact Information": signal.get("link", ""),
-                "Lead Score": score,
-                "Notes": " | ".join(reasons) + f" | link: {signal.get('link', '')}",
-                "Auto-Sourced": True,
+
+    else:
+
+        while True:
+
+            try:
+
+                max_ads = int(
+                    input(
+                        "How many ads should I search per keyword? "
+                    ).strip()
+                )
+
+                if max_ads > 0:
+                    break
+
+                print(
+                    "Enter a number greater than 0."
+                )
+
+            except ValueError:
+
+                print(
+                    "Please enter a valid whole number."
+                )
+
+    print(f"[info] Search limit: {max_ads}")
+
+    print(
+        f"[info] Search ID: {SEARCH_ID}"
+    )
+
+    print(
+        f"[info] Search keyword(s): "
+        f"{SEARCH_KEYWORD_FOR_RECORDS}"
+    )
+
+    print(
+        f"[info] Ad search limit per keyword: {max_ads}"
+    )
+
+    advertisers, raw_path = run_scraper(max_ads)
+
+    if not advertisers:
+
+        print(
+            "[warn] No advertisers returned."
+        )
+
+        return
+
+    print(
+        f"[info] Discovered {len(advertisers)} unique advertisers. "
+        "Processing every discovered advertiser; "
+        "no separate advertiser cap."
+    )
+
+    from enrichment.providers.facebook_ads_library import (
+        FacebookAdsLibraryProvider
+    )
+
+    provider = FacebookAdsLibraryProvider(
+        json_paths=[raw_path]
+    )
+
+    pipeline = build_pipeline(provider)
+
+    airtable_records = []
+
+    debug_results = []
+
+    processed_count = 0
+
+    for advertiser in advertisers:
+
+        brand_name = str(
+            advertiser.get("brand_name") or ""
+        ).strip()
+
+        if not brand_name:
+            continue
+
+        website = candidate_website(advertiser)
+
+        lead = normalise_advertiser(
+            advertiser,
+            website
+        )
+
+        processed_count += 1
+
+        print(
+            f"[{processed_count}/{len(advertisers)}] "
+            f"Enriching {brand_name}"
+        )
+
+        try:
+
+            result = pipeline.process_lead(lead)
+
+        except Exception as error:
+
+            result = {
+
+                "brand_name": brand_name,
+
+                "website": website,
+
+                "status": "pipeline_error",
+
+                "priority_score": None,
+
+                "priority_probability": None,
+
+                "errors": [
+
+                    f"Unhandled pipeline exception: "
+                    f"{type(error).__name__}: {error}"
+
+                ],
+
             }
 
-        # These two Airtable columns allow the dashboard to retrieve the exact
-        # results belonging to a particular manual or scheduled execution.
-        lead["Search ID"] = SEARCH_ID
-        lead["Search Keyword"] = search_keyword_for_records
-        leads.append(lead)
+        debug_results.append({
 
-    print(f"[info] {len(leads)} leads passed the score threshold")
-    write_to_airtable(leads)
+            "lead": lead,
+
+            "pipeline_result": result,
+
+        })
+
+        status = result.get(
+            "status",
+            "unknown"
+        )
+
+        if status != "rejected":
+
+            airtable_records.append(
+                make_airtable_record(
+                    lead,
+                    result
+                )
+            )
+
+        print(
+            f"[result] {brand_name}: {status} "
+            f"(ANN score: {result.get('priority_score')})"
+        )
+
+    # Save complete debug output, including rejected and pending advertisers.
+    write_debug_results(debug_results)
+
+    # Submit the non-rejected records to Airtable first.
+    # If this raises an exception, the Excel export will not run.
+    write_to_airtable(airtable_records)
+
+    # Export only the same non-rejected leads submitted to Airtable.
+    if airtable_records:
+
+        exportable_results = [
+            item
+            for item in debug_results
+            if item.get("pipeline_result", {}).get("status") != "rejected"
+        ]
+
+        export_path = export_to_excel(
+            results=exportable_results,
+            search_id=SEARCH_ID,
+            search_keywords=SEARCH_KEYWORD_FOR_RECORDS,
+            output_directory=ROOT / "data" / "exports"
+        )
+
+        print(f"[ok] Excel workbook generated: {export_path}")
+
+    else:
+
+        print("[info] No Airtable records to export.")
+
+    counts = {}
+
+    for item in debug_results:
+
+        status = item["pipeline_result"].get(
+            "status",
+            "unknown"
+        )
+
+        counts[status] = (
+            counts.get(status, 0) + 1
+        )
+
+    print(
+        f"[complete] Status summary: {counts}"
+    )
+
+    print(
+        f"[complete] Processed {processed_count} advertisers; "
+        f"sent {len(airtable_records)} non-rejected records to Airtable."
+    )
 
 
 if __name__ == "__main__":
+
     main()
