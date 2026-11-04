@@ -97,16 +97,18 @@ DEFAULT_AD_LIBRARY_KEYWORDS = [
     "apparel brand India",
 ]
 
+# Accept one keyword or multiple comma-separated keywords.
 AD_LIBRARY_KEYWORDS = (
-    [CUSTOM_KEYWORD]
+    [
+        keyword.strip()
+        for keyword in CUSTOM_KEYWORD.split(",")
+        if keyword.strip()
+    ]
     if CUSTOM_KEYWORD
     else DEFAULT_AD_LIBRARY_KEYWORDS
 )
 
-SEARCH_KEYWORD_FOR_RECORDS = (
-    CUSTOM_KEYWORD
-    or ", ".join(AD_LIBRARY_KEYWORDS)
-)
+SEARCH_KEYWORD_FOR_RECORDS = ", ".join(AD_LIBRARY_KEYWORDS)
 
 APPAREL_TERMS = {
     "apparel",
@@ -177,17 +179,13 @@ UNSUITABLE_HOSTS = {
 def scraper_python():
 
     candidates = [
-
         SCRAPER_REPO / ".venv" / "Scripts" / "python.exe",
-
         SCRAPER_REPO / ".venv" / "bin" / "python",
-
     ]
 
     for path in candidates:
 
         if path.exists():
-
             return str(path)
 
     return sys.executable
@@ -196,81 +194,103 @@ def scraper_python():
 def run_scraper(max_ads):
 
     if not SCRAPER_SCRIPT.is_file():
-
         raise FileNotFoundError(
             f"Facebook scraper not found: {SCRAPER_SCRIPT}"
         )
 
     collected = []
-
     seen_ids = set()
 
     for keyword in AD_LIBRARY_KEYWORDS:
 
         print(f"[info] Scraping: {keyword}")
 
+        # Prevent stale output from a previous keyword/run being reused.
+        if SCRAPER_OUTPUT.exists():
+            try:
+                SCRAPER_OUTPUT.unlink()
+            except OSError as error:
+                print(
+                    f"[warn] Could not remove previous scraper output: {error}"
+                )
+                continue
+
         command = [
-
             scraper_python(),
-
             str(SCRAPER_SCRIPT),
-
             "--query",
             keyword,
-
             "--region",
             SCRAPER_REGION,
-
             "--max-results",
             str(max_ads),
-
             "--details",
-
         ]
 
+        timed_out = False
+
         try:
-
             completed = subprocess.run(
-
                 command,
-
                 cwd=str(SCRAPER_REPO),
-
                 capture_output=True,
-
                 text=True,
-
                 timeout=SCRAPER_TIMEOUT,
-
                 check=False,
-
             )
 
-        except subprocess.TimeoutExpired:
+            if completed.stdout:
+                print(completed.stdout[-2500:])
+
+            if completed.returncode != 0:
+                print(
+                    f"[warn] Scraper exited with code "
+                    f"{completed.returncode} for '{keyword}'."
+                )
+
+                if completed.stderr:
+                    print(completed.stderr[-2000:])
+
+                print(
+                    "[info] Checking for usable partial results..."
+                )
+
+        except subprocess.TimeoutExpired as error:
+
+            timed_out = True
 
             print(
-                f"[warn] Scraper timed out: {keyword}"
+                f"[warn] Scraper timed out for '{keyword}' "
+                f"after {SCRAPER_TIMEOUT} seconds."
             )
 
-            continue
+            if error.stdout:
+                output = error.stdout
 
-        if completed.stdout:
+                if isinstance(output, bytes):
+                    output = output.decode(
+                        "utf-8",
+                        errors="replace"
+                    )
 
-            print(completed.stdout[-2500:])
+                print(output[-2500:])
 
-        if completed.returncode != 0:
+            if error.stderr:
+                error_text = error.stderr
 
-            print(
-                f"[warn] Scraper failed: "
-                f"{completed.stderr[-2000:]}"
-            )
+                if isinstance(error_text, bytes):
+                    error_text = error_text.decode(
+                        "utf-8",
+                        errors="replace"
+                    )
 
-            continue
+                print(error_text[-2000:])
 
+        # Check for output even if the scraper exited unsuccessfully.
         if not SCRAPER_OUTPUT.exists():
 
             print(
-                "[warn] Scraper output not found."
+                f"[warn] No fresh scraper output available for '{keyword}'."
             )
 
             continue
@@ -288,12 +308,19 @@ def run_scraper(max_ads):
         except (OSError, json.JSONDecodeError) as error:
 
             print(
-                f"[warn] Could not read scraper output: {error}"
+                f"[warn] Could not read scraper output for "
+                f"'{keyword}': {error}"
             )
 
             continue
 
         if not isinstance(ads, list):
+
+            print(
+                f"[warn] Scraper output for '{keyword}' "
+                "was not a JSON list."
+            )
+
             continue
 
         new_count = 0
@@ -321,11 +348,16 @@ def run_scraper(max_ads):
 
             new_count += 1
 
+        label = "partial " if timed_out else ""
+
         print(
-            f"[info] Added {new_count} unique ads."
+            f"[info] Added {new_count} unique ads "
+            f"from {label}results for '{keyword}'."
         )
 
     if not collected:
+
+        print("[warn] No ads were collected from any keyword.")
 
         return [], None
 
@@ -362,7 +394,14 @@ def run_scraper(max_ads):
         json_paths=[raw_path]
     )
 
-    return provider.get_advertisers(), raw_path
+    advertisers = provider.get_advertisers()
+
+    print(
+        f"[info] Collected {len(collected)} unique ads across "
+        f"{len(AD_LIBRARY_KEYWORDS)} keyword(s)."
+    )
+
+    return advertisers, raw_path
 
 
 # ============================================================
@@ -504,6 +543,7 @@ def classify_apparel_brand(advertiser):
         phrase in combined
         for phrase in negative_phrases
     ):
+
         return False
 
     # Categories are useful positive evidence.
@@ -578,6 +618,7 @@ def classify_apparel_brand(advertiser):
         return True
 
     return None
+
 
 def normalise_advertiser(advertiser, website):
 
@@ -1076,12 +1117,14 @@ def main():
     if configured_limit:
 
         try:
+
             max_ads = int(configured_limit)
 
             if max_ads <= 0:
                 raise ValueError
 
         except ValueError:
+
             raise ValueError(
                 f"Invalid SEARCH_LIMIT: {configured_limit}. "
                 "Expected a positive integer."
@@ -1223,12 +1266,14 @@ def main():
         )
 
         qualification = result.get("qualification") or {}
+
         is_qualified = (
             isinstance(qualification, dict)
             and qualification.get("qualified") is True
         )
 
         if is_qualified:
+
             airtable_records.append(
                 make_airtable_record(
                     lead,
@@ -1253,21 +1298,34 @@ def main():
         item
         for item in debug_results
         if (
-            isinstance(item.get("pipeline_result", {}).get("qualification"), dict)
-            and item["pipeline_result"]["qualification"].get("qualified") is True
+            isinstance(
+                item.get("pipeline_result", {}).get("qualification"),
+                dict
+            )
+            and item["pipeline_result"]["qualification"].get(
+                "qualified"
+            ) is True
         )
     ]
 
     if qualified_results:
+
         export_path = export_to_excel(
             results=qualified_results,
             search_id=SEARCH_ID,
             search_keywords=SEARCH_KEYWORD_FOR_RECORDS,
             output_directory=ROOT / "data" / "exports"
         )
-        print(f"[ok] Qualified-lead Excel workbook generated: {export_path}")
+
+        print(
+            f"[ok] Qualified-lead Excel workbook generated: {export_path}"
+        )
+
     else:
-        print("[info] No qualified leads found; no Excel export generated.")
+
+        print(
+            "[info] No qualified leads found; no Excel export generated."
+        )
 
     counts = {}
 
@@ -1288,7 +1346,7 @@ def main():
 
     print(
         f"[complete] Processed {processed_count} advertisers; "
-        f"sent {len(airtable_records)} non-rejected records to Airtable."
+        f"sent {len(airtable_records)} qualified records to Airtable."
     )
 
 
