@@ -1,0 +1,59 @@
+name: Run Lead-Gen Monitor
+
+on:
+  schedule:
+    - cron: "0 6,18 * * *"
+
+  workflow_dispatch:
+    inputs:
+      keyword:
+        description: "Keyword to search in Meta Ad Library (leave blank for default searches)"
+        required: false
+        type: string
+        default: ""
+      search_limit:
+        description: "Maximum number of unique brands to process"
+        required: false
+        type: choice
+        options:
+          - "10"
+          - "25"
+          - "50"
+          - "100"
+        default: "25"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: leadgen-monitor
+  cancel-in-progress: false
+
+jobs:
+  run-leadgen:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run lead-gen monitor
+        env:
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
+          APIFY_API_TOKEN: ${{ secrets.APIFY_API_TOKEN }}
+          METAPI_API_KEY: ${{ secrets.METAPI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          SEARCH_KEYWORD: ${{ github.event.inputs.keyword || '' }}
+          SEARCH_LIMIT: ${{ github.event.inputs.search_limit || '25' }}
+          SEARCH_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: python main.py

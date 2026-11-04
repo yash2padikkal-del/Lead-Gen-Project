@@ -585,9 +585,9 @@ export default function Home() {
               <div className="rounded-[28px] bg-[#a9dcf5] p-8 text-[#174e70]">
                 <p className="text-xs font-bold uppercase tracking-widest">How it works</p>
                 <div className="mt-8 space-y-7">
-                  <ProcessStep number="01" title="Discover" description="Apify searches the Meta Ad Library for matching brands." />
-                  <ProcessStep number="02" title="Qualify" description="Groq evaluates potential leads and assigns scores." />
-                  <ProcessStep number="03" title="Enrich" description="Your scraper gathers additional contact information." />
+                  <ProcessStep number="01" title="Discover" description="We search the meta ad library for businesses relevant to your brand." />
+                  <ProcessStep number="02" title="Qualify" description="Our qualification algorithm passes leads to ANN for scoring." />
+                  <ProcessStep number="03" title="Enrich" description="ANN Scored leads are enriched for contact details." />
                   <ProcessStep number="04" title="Store" description="Qualified leads are added to your Airtable database." />
                 </div>
               </div>
