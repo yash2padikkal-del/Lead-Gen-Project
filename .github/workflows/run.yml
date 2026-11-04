@@ -8,6 +8,11 @@ on:
 
   workflow_dispatch:
     inputs:
+      request_id:
+        description: "Unique frontend search request ID"
+        required: false
+        type: string
+        default: ""
       keyword:
         description: "Keyword to search in Meta Ad Library"
         required: false
