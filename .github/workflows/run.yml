@@ -1,18 +1,15 @@
 name: Run Lead-Gen Monitor
+
 run-name: LeadGen Search - ${{ inputs.request_id || 'Scheduled Run' }}
+
 on:
   schedule:
     - cron: "0 6,18 * * *"
 
   workflow_dispatch:
     inputs:
-      request_id:
-        description: "Unique frontend search request ID"
-        required: false
-        type: string
-        default: ""
       keyword:
-        description: "Keyword to search in Meta Ad Library (leave blank for default searches)"
+        description: "Keyword to search in Meta Ad Library"
         required: false
         type: string
         default: ""
@@ -28,6 +25,12 @@ on:
           - "100"
         default: "25"
 
+      request_id:
+        description: "Unique ID for this dashboard search"
+        required: false
+        type: string
+        default: ""
+
 permissions:
   contents: read
   actions: read
@@ -41,16 +44,30 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout LeadGen
         uses: actions/checkout@v4
+
+      - name: Checkout Facebook scraper
+        uses: actions/checkout@v4
+        with:
+          repository: 2scraper/facebook-ads-scraper
+          path: facebook-ads-scraper
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - name: Install LeadGen dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install scraper dependencies
+        working-directory: facebook-ads-scraper
+        run: |
+          pip install -r requirements-playwright.txt
+          playwright install --with-deps chromium
 
       - name: Run lead-gen monitor
         env:
