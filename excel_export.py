@@ -31,7 +31,6 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 # ============================================================
 
 def safe_list(value):
-
     if isinstance(value, list):
         return value
 
@@ -42,7 +41,6 @@ def safe_list(value):
 
 
 def join_values(value):
-
     return ", ".join(
         str(item)
         for item in safe_list(value)
@@ -50,8 +48,18 @@ def join_values(value):
     )
 
 
-def get_qualification_status(result):
+def get_business_phones(result):
+    contacts = (
+        result.get("enrichment", {})
+        .get("contacts", {})
+    )
 
+    return join_values(
+        contacts.get("business_phones", [])
+    )
+
+
+def get_qualification_status(result):
     qualification = result.get(
         "qualification",
         {}
@@ -69,7 +77,6 @@ def get_qualification_status(result):
 
 
 def get_contact_sources(sources):
-
     if not isinstance(sources, dict):
         return ""
 
@@ -80,7 +87,6 @@ def get_contact_sources(sources):
 
 
 def style_sheet(ws):
-
     header_fill = PatternFill(
         "solid",
         fgColor="202A44"
@@ -98,7 +104,6 @@ def style_sheet(ws):
     )
 
     for cell in ws[1]:
-
         cell.fill = header_fill
         cell.font = header_font
 
@@ -113,13 +118,9 @@ def style_sheet(ws):
 
     ws.freeze_panes = "A2"
 
-    # Excel Table objects provide their own AutoFilter; do not add a
-    # second overlapping worksheet-level AutoFilter here.
-
     ws.row_dimensions[1].height = 28
 
     for column in ws.columns:
-
         max_length = 0
 
         column_letter = get_column_letter(
@@ -127,14 +128,12 @@ def style_sheet(ws):
         )
 
         for cell in column:
-
             cell.alignment = Alignment(
                 vertical="top",
                 wrap_text=True
             )
 
             if cell.value is not None:
-
                 max_length = max(
                     max_length,
                     len(str(cell.value))
@@ -149,7 +148,6 @@ def style_sheet(ws):
 
 
 def add_table(ws, name):
-
     if ws.max_row < 2:
         return
 
@@ -172,13 +170,10 @@ def add_table(ws, name):
 
 
 def add_hyperlink(cell):
-
     if cell.value and isinstance(cell.value, str):
-
         if cell.value.startswith(
             ("http://", "https://")
         ):
-
             cell.hyperlink = cell.value
             cell.style = "Hyperlink"
 
@@ -188,15 +183,13 @@ def add_hyperlink(cell):
 # ============================================================
 
 def build_leads_sheet(workbook, results):
-
     ws = workbook.active
-
     ws.title = "Leads"
 
     headers = [
-
         "Brand Name",
         "Website",
+        "Business Phones",
         "Instagram",
         "Instagram Followers",
         "Facebook Page",
@@ -209,13 +202,11 @@ def build_leads_sheet(workbook, results):
         "Search Keywords",
         "Missing Features",
         "Processing Errors",
-
     ]
 
     ws.append(headers)
 
     for item in results:
-
         lead = item.get(
             "lead",
             {}
@@ -259,10 +250,11 @@ def build_leads_sheet(workbook, results):
         )
 
         ws.append([
-
             lead.get("brand_name"),
 
             lead.get("website"),
+
+            get_business_phones(result),
 
             instagram_url,
 
@@ -293,13 +285,11 @@ def build_leads_sheet(workbook, results):
             join_values(
                 result.get("errors")
             ),
-
         ])
 
         row = ws.max_row
 
-        for column in (2, 3, 5):
-
+        for column in (2, 4, 6):
             add_hyperlink(
                 ws.cell(
                     row=row,
@@ -320,13 +310,11 @@ def build_leads_sheet(workbook, results):
 # ============================================================
 
 def build_contacts_sheet(workbook, results):
-
     ws = workbook.create_sheet(
         "Contacts"
     )
 
     headers = [
-
         "Brand Name",
         "Website",
         "Business Phones",
@@ -336,13 +324,11 @@ def build_contacts_sheet(workbook, results):
         "Pages Checked",
         "Pages Checked Count",
         "Enrichment Errors",
-
     ]
 
     ws.append(headers)
 
     for item in results:
-
         lead = item.get(
             "lead",
             {}
@@ -399,7 +385,6 @@ def build_contacts_sheet(workbook, results):
         )
 
         ws.append([
-
             lead.get("brand_name"),
 
             website,
@@ -420,7 +405,6 @@ def build_contacts_sheet(workbook, results):
             ),
 
             join_values(errors),
-
         ])
 
         add_hyperlink(
@@ -448,13 +432,11 @@ def build_summary_sheet(
     search_id,
     search_keywords
 ):
-
     ws = workbook.create_sheet(
         "Run Summary"
     )
 
     status_counts = {}
-
     scores = []
 
     qualified_count = 0
@@ -465,7 +447,6 @@ def build_summary_sheet(
     email_count = 0
 
     for item in results:
-
         result = item.get(
             "pipeline_result",
             {}
@@ -485,7 +466,6 @@ def build_summary_sheet(
         )
 
         if isinstance(score, (int, float)):
-
             scores.append(score)
 
         qualification_status = (
@@ -493,15 +473,12 @@ def build_summary_sheet(
         )
 
         if qualification_status == "Qualified":
-
             qualified_count += 1
 
         elif qualification_status == "Pending":
-
             pending_count += 1
 
         else:
-
             not_qualified_count += 1
 
         contacts = (
@@ -522,7 +499,6 @@ def build_summary_sheet(
     )
 
     summary = [
-
         ["Metric", "Value"],
 
         ["Search ID", search_id],
@@ -575,7 +551,6 @@ def build_summary_sheet(
             "Not Qualified",
             not_qualified_count
         ],
-
     ]
 
     for row in summary:
@@ -591,7 +566,6 @@ def build_summary_sheet(
     for status, count in sorted(
         status_counts.items()
     ):
-
         ws.append([
             status,
             count
@@ -613,7 +587,6 @@ def export_to_excel(
     search_keywords,
     output_directory
 ):
-
     output_directory = Path(
         output_directory
     )
@@ -654,3 +627,4 @@ def export_to_excel(
     )
 
     return output_path
+
